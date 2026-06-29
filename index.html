@@ -933,6 +933,60 @@ async function syncUp() {
   }
 }
 
+// ═══════════════════════════════════════════════════
+//  SYNC MERGE — read latest from server, apply ONLY this
+//  client's specific change, then save. Prevents one user
+//  from overwriting another's data (last-write-wins fix).
+//  applyFn receives {participants, matches} FRESH from server
+//  and must mutate/return the same shape.
+// ═══════════════════════════════════════════════════
+async function syncMerge(applyFn) {
+  if(!binId) return false;
+  if(role === 'guest') { showToast('No puedes guardar como invitado', true); return false; }
+  setSyncStatus('syncing', 'Guardando...');
+  try {
+    // 1) READ latest from server
+    const getResp = await fetch(`${API_BASE}/${binId}/latest`, {
+      headers: { 'X-Master-Key': API_KEY }
+    });
+    if(!getResp.ok) throw new Error('GET HTTP '+getResp.status);
+    const data = await getResp.json();
+    const server = data.record || {};
+    let serverParticipants = Array.isArray(server.participants) ? server.participants : [];
+    let serverMatches = Array.isArray(server.matches) ? server.matches : [];
+
+    // 2) APPLY only this client's change on top of fresh server data
+    const merged = applyFn(serverParticipants, serverMatches) || {};
+    const finalParticipants = merged.participants || serverParticipants;
+    const finalMatches = merged.matches || serverMatches;
+
+    // 3) WRITE merged result back
+    const payload = {
+      name: 'quiniela-cachetona-eliminatorias-v2',
+      participants: finalParticipants,
+      matches: finalMatches,
+      updatedAt: Date.now()
+    };
+    const putResp = await fetch(`${API_BASE}/${binId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'X-Master-Key': API_KEY },
+      body: JSON.stringify(payload)
+    });
+    if(!putResp.ok) throw new Error('PUT HTTP '+putResp.status);
+
+    // 4) Update local state to match what we just saved
+    participants = finalParticipants;
+    matches = finalMatches;
+    setSyncStatus('ok', 'Guardado ✓');
+    return true;
+  } catch(e) {
+    setSyncStatus('error', 'Error');
+    showToast('Error al guardar. Intenta de nuevo.', true);
+    console.error(e);
+    return false;
+  }
+}
+
 function setSyncStatus(state, text) {
   document.getElementById('sync-dot').className = 'sync-dot ' + state;
   document.getElementById('sync-text').textContent = text;
@@ -996,14 +1050,23 @@ async function addParticipant() {
     return showToast('Ya existe ese nombre', true);
   if(pass && !/^\d{4}$/.test(pass)) return showToast('La contraseña debe ser 4 dígitos', true);
   if(!pass) pass = generatePIN();
-  participants.push({
+  const newPlayer = {
     id: 'P_' + Date.now().toString(36) + Math.random().toString(36).slice(2,5),
     name, password: pass, picks: {}
+  };
+  // MERGE: append to the CURRENT server list (don't overwrite others' additions)
+  const ok = await syncMerge((sParticipants, sMatches) => {
+    // guard against a duplicate that may have been added on the server meanwhile
+    if(!sParticipants.find(p => p.name.toLowerCase() === name.toLowerCase())) {
+      sParticipants.push(newPlayer);
+    }
+    return { participants: sParticipants, matches: sMatches };
   });
-  await syncUp();
-  nameEl.value = ''; passEl.value = '';
-  renderPeople();
-  showToast(`${name} agregado · PIN: ${pass}`);
+  if(ok) {
+    nameEl.value = ''; passEl.value = '';
+    renderPeople();
+    showToast(`${name} agregado · PIN: ${pass}`);
+  }
 }
 
 function renderPeople() {
@@ -1039,15 +1102,20 @@ function toggleShowPasswords() {
 
 async function generateMissingPasswords() {
   if(role !== 'admin') return;
+  // MERGE: assign PINs to whoever is missing one ON THE SERVER
   let added = 0;
-  participants.forEach(p => {
-    if(!p.password || !/^\d{4}$/.test(p.password)) {
-      p.password = generatePIN();
-      added++;
-    }
+  const ok = await syncMerge((sParticipants, sMatches) => {
+    added = 0;
+    sParticipants.forEach(p => {
+      if(!p.password || !/^\d{4}$/.test(p.password)) {
+        p.password = generatePIN();
+        added++;
+      }
+    });
+    return { participants: sParticipants, matches: sMatches };
   });
+  if(!ok) return;
   if(!added) return showToast('Todos ya tienen contraseña');
-  await syncUp();
   showPasswords = true;
   renderPeople();
   showToast(`${added} contraseñas asignadas · revisa la lista`);
@@ -1086,13 +1154,21 @@ async function savePersonFromModal() {
   if(pass && !/^\d{4}$/.test(pass)) return showToast('Contraseña debe ser 4 dígitos', true);
   const dup = participants.find(p=>p.id!==editingPersonId && p.name.toLowerCase()===name.toLowerCase());
   if(dup) return showToast('Ya existe ese nombre', true);
-  const p = participants.find(x=>x.id===editingPersonId);
-  p.name = name;
-  if(pass) p.password = pass;
-  await syncUp();
-  closePersonModal();
-  renderPeople();
-  showToast('Actualizado ✓');
+  const targetId = editingPersonId;
+  // MERGE: edit only this player on top of fresh server data
+  const ok = await syncMerge((sParticipants, sMatches) => {
+    const p = sParticipants.find(x => x.id === targetId);
+    if(p) {
+      p.name = name;
+      if(pass) p.password = pass;
+    }
+    return { participants: sParticipants, matches: sMatches };
+  });
+  if(ok) {
+    closePersonModal();
+    renderPeople();
+    showToast('Actualizado ✓');
+  }
 }
 async function deletePersonFromModal() {
   if(!editingPersonId) return;
@@ -1111,6 +1187,7 @@ async function importFromGroups() {
   if(!confirm('Importar los nombres de la fase de grupos? Solo se agregan nombres nuevos con PIN aleatorio.')) return;
   setSyncStatus('syncing', 'Importando...');
   try {
+    // First, fetch the group-stage participant names
     const resp = await fetch(`${API_BASE}/${GROUPS_BIN_ID}/latest`, {
       headers: { 'X-Master-Key': API_KEY }
     });
@@ -1118,22 +1195,25 @@ async function importFromGroups() {
     const data = await resp.json();
     const gp = data.record.participants || [];
     let added = 0;
-    gp.forEach(g => {
-      if(!participants.find(p => p.name.toLowerCase() === g.name.toLowerCase())) {
-        participants.push({
-          id: 'P_' + Date.now().toString(36) + Math.random().toString(36).slice(2,5),
-          name: g.name, password: generatePIN(), picks: {}
-        });
-        added++;
-      }
+    // MERGE: add new names on top of the CURRENT eliminatorias server list
+    const ok = await syncMerge((sParticipants, sMatches) => {
+      added = 0;
+      gp.forEach(g => {
+        if(!sParticipants.find(p => p.name.toLowerCase() === g.name.toLowerCase())) {
+          sParticipants.push({
+            id: 'P_' + Date.now().toString(36) + Math.random().toString(36).slice(2,5) + added,
+            name: g.name, password: generatePIN(), picks: {}
+          });
+          added++;
+        }
+      });
+      return { participants: sParticipants, matches: sMatches };
     });
-    if(added > 0) {
-      await syncUp();
+    if(ok && added > 0) {
       showPasswords = true;
       renderPeople();
       showToast(`${added} jugadores importados con PIN`);
-    } else {
-      setSyncStatus('ok', 'OK');
+    } else if(ok) {
       showToast('Sin nuevos nombres por importar');
     }
   } catch(e) {
@@ -1219,17 +1299,23 @@ async function saveMatchFromModal() {
   const homeFlag = homeFlagInp || TEAM_FLAGS[home] || '🏳️';
   const awayFlag = awayFlagInp || TEAM_FLAGS[away] || '🏳️';
 
-  if(editingMatchId) {
-    const m = matches.find(x=>x.id===editingMatchId);
-    if(m) { m.phase=phase; m.datetime=ts; m.home=home; m.homeFlag=homeFlag; m.away=away; m.awayFlag=awayFlag; }
-  } else {
-    const id = 'M_' + Date.now().toString(36) + Math.random().toString(36).slice(2,5);
-    matches.push({ id, phase, datetime: ts, home, homeFlag, away, awayFlag, result: null });
+  const editId = editingMatchId;
+  // MERGE: add or edit only this match on top of fresh server data
+  const ok = await syncMerge((sParticipants, sMatches) => {
+    if(editId) {
+      const m = sMatches.find(x => x.id === editId);
+      if(m) { m.phase=phase; m.datetime=ts; m.home=home; m.homeFlag=homeFlag; m.away=away; m.awayFlag=awayFlag; }
+    } else {
+      const id = 'M_' + Date.now().toString(36) + Math.random().toString(36).slice(2,5);
+      sMatches.push({ id, phase, datetime: ts, home, homeFlag, away, awayFlag, result: null });
+    }
+    return { participants: sParticipants, matches: sMatches };
+  });
+  if(ok) {
+    closeMatchModal();
+    renderAll();
+    showToast(editId ? 'Partido actualizado' : 'Partido agregado ✓');
   }
-  await syncUp();
-  closeMatchModal();
-  renderAll();
-  showToast(editingMatchId ? 'Partido actualizado' : 'Partido agregado ✓');
 }
 
 function deleteMatchFromModal() {
@@ -1249,17 +1335,23 @@ function closeDeleteModal() {
   deleteTargetId = null; deleteTargetType = null;
 }
 async function confirmDelete() {
-  if(deleteTargetType === 'participant') {
-    participants = participants.filter(p => p.id !== deleteTargetId);
-  } else if(deleteTargetType === 'match') {
-    const mid = deleteTargetId;
-    matches = matches.filter(m => m.id !== mid);
-    participants.forEach(p => { if(p.picks && p.picks[mid]) delete p.picks[mid]; });
+  const tType = deleteTargetType;
+  const tId = deleteTargetId;
+  // MERGE: apply the deletion on top of fresh server data
+  const ok = await syncMerge((sParticipants, sMatches) => {
+    if(tType === 'participant') {
+      sParticipants = sParticipants.filter(p => p.id !== tId);
+    } else if(tType === 'match') {
+      sMatches = sMatches.filter(m => m.id !== tId);
+      sParticipants.forEach(p => { if(p.picks && p.picks[tId]) delete p.picks[tId]; });
+    }
+    return { participants: sParticipants, matches: sMatches };
+  });
+  if(ok) {
+    closeDeleteModal();
+    renderAll();
+    showToast('Eliminado');
   }
-  await syncUp();
-  closeDeleteModal();
-  renderAll();
-  showToast('Eliminado');
 }
 
 // ═══════════════════════════════════════════════════
@@ -1487,48 +1579,87 @@ function setPendingChanges(v) {
 
 async function saveMyPicks() {
   if(role !== 'user') return;
-  const me = participants.find(p=>p.id===currentUserId);
-  if(!me) return;
-  if(!me.picks) me.picks = {};
-  // Validate each dirty pick: only commit ones where match is not locked
+  // Snapshot which matches are still open (not locked) and the dirty picks to commit
+  const dirtySnapshot = {};
   let committed = 0;
   Object.keys(myDirtyPicks).forEach(mid => {
     const m = matches.find(x=>x.id===mid);
     if(!m) return;
     const lock = getMatchLockStatus(m.datetime);
     if(lock.locked) return; // skip locked matches
-    me.picks[mid] = Object.assign({}, me.picks[mid] || {}, myDirtyPicks[mid]);
+    dirtySnapshot[mid] = Object.assign({}, myDirtyPicks[mid]);
     committed++;
   });
-  await syncUp();
-  myDirtyPicks = {};
-  setPendingChanges(false);
-  renderMatches();
-  showToast(`${committed} ${committed===1?'pick guardado':'picks guardados'} ✓`);
+  if(committed === 0) {
+    myDirtyPicks = {};
+    setPendingChanges(false);
+    renderMatches();
+    showToast('Esos partidos ya están cerrados', true);
+    return;
+  }
+  // MERGE: only touch THIS user's picks on top of fresh server data
+  const ok = await syncMerge((sParticipants, sMatches) => {
+    const meServer = sParticipants.find(p => p.id === currentUserId);
+    if(meServer) {
+      if(!meServer.picks) meServer.picks = {};
+      Object.keys(dirtySnapshot).forEach(mid => {
+        // double-check lock against server match time too
+        const sm = sMatches.find(x => x.id === mid);
+        if(sm) {
+          const lk = getMatchLockStatus(sm.datetime);
+          if(lk.locked) return;
+        }
+        meServer.picks[mid] = Object.assign({}, meServer.picks[mid] || {}, dirtySnapshot[mid]);
+      });
+    }
+    return { participants: sParticipants, matches: sMatches };
+  });
+  if(ok) {
+    myDirtyPicks = {};
+    setPendingChanges(false);
+    renderMatches();
+    showToast(`${committed} ${committed===1?'pick guardado':'picks guardados'} ✓`);
+  }
 }
 
 // ADMIN: SET RESULTS
 async function setResultScore(mid, side, val) {
   if(role !== 'admin') return;
-  const m = matches.find(x=>x.id===mid);
-  if(!m) return;
-  if(!m.result) m.result = {};
   const v = val === '' ? null : Math.max(0, Math.min(20, parseInt(val,10)||0));
-  if(side === 'home') m.result.homeGoals = v;
-  else m.result.awayGoals = v;
-  await syncUp();
-  renderMatches();
-  renderLeaderboard();
+  // MERGE: only touch THIS match's result on top of fresh server data
+  const ok = await syncMerge((sParticipants, sMatches) => {
+    const sm = sMatches.find(x => x.id === mid);
+    if(sm) {
+      if(!sm.result) sm.result = {};
+      if(side === 'home') sm.result.homeGoals = v;
+      else sm.result.awayGoals = v;
+    }
+    return { participants: sParticipants, matches: sMatches };
+  });
+  if(ok) {
+    renderMatches();
+    renderLeaderboard();
+  }
 }
 async function setResultPasser(mid, side) {
   if(role !== 'admin') return;
-  const m = matches.find(x=>x.id===mid);
-  if(!m) return;
-  if(!m.result) m.result = {};
-  m.result.passer = m.result.passer === side ? null : side;
-  await syncUp();
-  renderMatches();
-  renderLeaderboard();
+  // Determine the new value based on current LOCAL state (toggle)
+  const localM = matches.find(x=>x.id===mid);
+  const currentPasser = (localM && localM.result) ? localM.result.passer : null;
+  const newPasser = currentPasser === side ? null : side;
+  // MERGE: only touch THIS match's passer on top of fresh server data
+  const ok = await syncMerge((sParticipants, sMatches) => {
+    const sm = sMatches.find(x => x.id === mid);
+    if(sm) {
+      if(!sm.result) sm.result = {};
+      sm.result.passer = newPasser;
+    }
+    return { participants: sParticipants, matches: sMatches };
+  });
+  if(ok) {
+    renderMatches();
+    renderLeaderboard();
+  }
 }
 
 // ═══════════════════════════════════════════════════
@@ -1967,33 +2098,53 @@ async function confirmImportMatches() {
   if(!importPreviewData) return;
   const { toAdd, toUpdate } = importPreviewData;
   if(!toAdd.length && !toUpdate.length) return;
-
-  // Apply new matches
-  toAdd.forEach(km => {
-    const id = 'M_' + Date.now().toString(36) + Math.random().toString(36).slice(2,5);
-    matches.push({
-      id, phase: km.phase, datetime: km.datetime,
-      home: km.home, homeFlag: km.homeFlag,
-      away: km.away, awayFlag: km.awayFlag,
-      result: km.result ? { ...km.result, passer: null } : null
-    });
-  });
-  // Apply updates
-  toUpdate.forEach(u => {
-    if(u.dtChanged) u.existing.datetime = u.incoming.datetime;
-    if(u.hasNewResult) {
-      if(!u.existing.result) u.existing.result = {};
-      u.existing.result.homeGoals = u.incoming.result.homeGoals;
-      u.existing.result.awayGoals = u.incoming.result.awayGoals;
-      // Don't override passer - admin decides that separately
-    }
-  });
-
-  closeImportModal();
-  await syncUp();
-  renderAll();
   const total = toAdd.length + toUpdate.length;
-  showToast(`✓ ${total} ${total===1?'cambio aplicado':'cambios aplicados'}`);
+
+  // MERGE: apply additions/updates on top of fresh server data.
+  // We match existing games by phase + teams (order-independent) instead of
+  // by object reference, so we update the right game on the server copy.
+  const ok = await syncMerge((sParticipants, sMatches) => {
+    // additions
+    toAdd.forEach(km => {
+      const dup = sMatches.find(em =>
+        em.phase === km.phase &&
+        ((em.home === km.home && em.away === km.away) ||
+         (em.home === km.away && em.away === km.home)));
+      if(!dup) {
+        const id = 'M_' + Date.now().toString(36) + Math.random().toString(36).slice(2,5) + Math.floor(Math.random()*999);
+        sMatches.push({
+          id, phase: km.phase, datetime: km.datetime,
+          home: km.home, homeFlag: km.homeFlag,
+          away: km.away, awayFlag: km.awayFlag,
+          result: km.result ? { homeGoals: km.result.homeGoals, awayGoals: km.result.awayGoals, passer: null } : null
+        });
+      }
+    });
+    // updates
+    toUpdate.forEach(u => {
+      const km = u.incoming;
+      const target = sMatches.find(em =>
+        em.phase === km.phase &&
+        ((em.home === km.home && em.away === km.away) ||
+         (em.home === km.away && em.away === km.home)));
+      if(target) {
+        if(u.dtChanged) target.datetime = km.datetime;
+        if(u.hasNewResult && km.result) {
+          if(!target.result) target.result = {};
+          target.result.homeGoals = km.result.homeGoals;
+          target.result.awayGoals = km.result.awayGoals;
+          // Don't override passer - admin decides that separately
+        }
+      }
+    });
+    return { participants: sParticipants, matches: sMatches };
+  });
+
+  if(ok) {
+    closeImportModal();
+    renderAll();
+    showToast(`✓ ${total} ${total===1?'cambio aplicado':'cambios aplicados'}`);
+  }
 }
 
 // ═══════════════════════════════════════════════════
